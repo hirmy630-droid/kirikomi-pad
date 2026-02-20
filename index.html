@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>切込寸法 計算アプリ - iPad Pro Edition</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Firebase Libraries -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, onSnapshot, query, deleteDoc, doc, getDocs, writeBatch, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global state
+        window.historyData = [];
+        let db, auth, userId;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'cutting-calc-app';
+        let lastSavedHash = ""; 
+        
+        const useLocalState = typeof __firebase_config === 'undefined';
+
+        const initFirebase = async () => {
+            if (useLocalState) {
+                window.renderHistory();
+                return;
+            }
+
+            try {
+                const firebaseConfig = JSON.parse(__firebase_config);
+                const app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+
+                const initAuth = async () => {
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                };
+
+                await initAuth();
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        loadHistory();
+                    }
+                });
+            } catch (e) {
+                console.error("Firebase初期化エラー:", e);
+            }
+        };
+
+        const loadHistory = () => {
+            if (useLocalState || !userId) return;
+            const historyCol = collection(db, 'artifacts', appId, 'users', userId, 'history');
+            
+            onSnapshot(historyCol, async (snapshot) => {
+                const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                window.historyData = data.sort((a, b) => {
+                    if (a.checked !== b.checked) return a.checked ? -1 : 1;
+                    return b.createdAt - a.createdAt;
+                });
+                
+                const uncheckedItems = window.historyData.filter(item => !item.checked);
+                if (uncheckedItems.length > 5) {
+                    const toDelete = uncheckedItems.slice(5); 
+                    const batch = writeBatch(db);
+                    toDelete.forEach(item => {
+                        batch.delete(doc(db, 'artifacts', appId, 'users', userId, 'history', item.id));
+                    });
+                    await batch.commit();
+                }
+                window.renderHistory();
+            }, (error) => {
+                console.error("Firestore Loading Error:", error);
+            });
+        };
+
+        window.saveToCloud = async (item) => {
+            if (!item) return;
+            const hash = JSON.stringify(item.inputs) + item.mode + item.no + (item.calcDir || '');
+            if (hash === lastSavedHash) return; 
+            lastSavedHash = hash;
+
+            const newItem = { ...item, checked: false, createdAt: Date.now() };
+
+            if (useLocalState) {
+                newItem.id = Date.now().toString();
+                window.historyData.unshift(newItem);
+                window.historyData.sort((a, b) => {
+                    if (a.checked !== b.checked) return a.checked ? -1 : 1;
+                    return b.createdAt - a.createdAt;
+                });
+                const uncheckedItems = window.historyData.filter(d => !d.checked);
+                if (uncheckedItems.length > 5) {
+                    const idsToDelete = uncheckedItems.slice(5).map(d => d.id);
+                    window.historyData = window.historyData.filter(d => !idsToDelete.includes(d.id));
+                }
+                window.renderHistory();
+                return;
+            }
+
+            if (!userId) return;
+            const historyCol = collection(db, 'artifacts', appId, 'users', userId, 'history');
+            await addDoc(historyCol, newItem);
+        };
+
+        window.toggleCheck = async (id, currentStatus) => {
+            if (useLocalState) {
+                const item = window.historyData.find(d => d.id === id);
+                if (item) item.checked = !currentStatus;
+                window.historyData.sort((a, b) => {
+                    if (a.checked !== b.checked) return a.checked ? -1 : 1;
+                    return b.createdAt - a.createdAt;
+                });
+                window.renderHistory();
+                return;
+            }
+            if (!userId) return;
+            const docRef = doc(db, 'artifacts', appId, 'users', userId, 'history', id);
+            await updateDoc(docRef, { checked: !currentStatus });
+        };
+
+        window.openConfirm = (action, mode = '') => {
+            const modal = document.getElementById('customConfirmModal');
+            const msg = document.getElementById('confirmMessage');
+            window.pendingAction = { action, mode };
+            msg.innerText = action === 'category' ? `${mode}切込の履歴を削除しますか？` : "全ての履歴を一括削除しますか？";
+            modal.classList.remove('hidden');
+        };
+
+        window.executeConfirm = async () => {
+            if (!window.pendingAction) return;
+            const { action, mode } = window.pendingAction;
+            if (useLocalState) {
+                window.historyData = window.historyData.filter(d => {
+                    if (d.checked) return true;
+                    if (action === 'all') return false;
+                    if (action === 'category' && d.mode === mode) return false;
+                    return true;
+                });
+                document.getElementById('customConfirmModal').classList.add('hidden');
+                window.renderHistory();
+                return;
+            }
+            if (!userId) return;
+            let itemsToDelete = window.historyData.filter(d => !d.checked && (action === 'all' || d.mode === mode));
+            if (itemsToDelete.length > 0) {
+                const batch = writeBatch(db);
+                itemsToDelete.forEach(d => batch.delete(doc(db, 'artifacts', appId, 'users', userId, 'history', d.id)));
+                await batch.commit();
+            }
+            document.getElementById('customConfirmModal').classList.add('hidden');
+        };
+
+        window.onload = initFirebase;
+    </script>
+
+    <style>
+        :root {
+            --side-color: #ff9f0a;
+            --height-color: #e67600;
+        }
+
+        body { 
+            background-color: #000000; 
+            color: #ffffff; 
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif; 
+            overflow: hidden; 
+        }
+
+        .input-card { background: #1c1c1e; border-radius: 14px; box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3); }
+        
+        input { background-color: #2c2c2e !important; color: #ffffff !important; border: 1px solid #3a3a3c !important; }
+        .input-highlight-side { border: 2px solid var(--side-color) !important; }
+        .input-highlight-height { border: 2px solid var(--height-color) !important; }
+        input::placeholder { font-size: 14px; color: #636366; }
+
+        .history-item { 
+            animation: slideIn 0.3s ease-out; 
+            background: #1c1c1e; 
+            border: 1px solid #2c2c2e; 
+            cursor: pointer;
+            transition: all 0.1s ease;
+        }
+        .history-item:active { transform: scale(0.98); background: #2c2c2e; }
+
+        .dir-switch-bar { background-color: #1c1c1e; padding: 2px; border-radius: 8px; }
+        .dir-button { font-size: 12px !important; color: #aeaeb2; padding: 4px 10px; transition: all 0.2s; border: 2px solid transparent; }
+        .dir-active { 
+            background-color: #3a3a3c !important; 
+            color: var(--side-color) !important; 
+            border: 2px solid var(--side-color) !important; 
+            border-radius: 6px; 
+        }
+
+        .save-btn-3d-side {
+            background: linear-gradient(180deg, #ffb340 0%, #ff9f0a 100%);
+            border-bottom: 4px solid #cc7f08;
+        }
+        .save-btn-3d-height {
+            background: linear-gradient(180deg, #ff8c00 0%, #e67600 100%);
+            border-bottom: 4px solid #994f00;
+        }
+        .save-btn-3d-side:active, .save-btn-3d-height:active { border-bottom-width: 0px; transform: translateY(4px); }
+
+        .btn-gray-3d { background: linear-gradient(180deg, #aeaeb2 0%, #8e8e93 100%); color: #ffffff; border: 1px solid #aeaeb2; box-shadow: 0 3px 0 #3a3a3c; }
+        .btn-silver-3d { background: linear-gradient(180deg, #f2f2f7 0%, #d1d1d6 100%); color: #1c1c1e; border: 1px solid #ffffff; box-shadow: 0 3px 0 #48484a; }
+
+        /* iPad 2列レイアウト用のスクロール設定 */
+        .column-scroll {
+            height: calc(100vh - 100px);
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #3a3a3c; border-radius: 10px; }
+
+        @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="text-white">
+
+<div class="h-screen flex flex-col overflow-hidden">
+    <header class="flex-shrink-0 flex items-center justify-between px-8 py-4 border-b border-[#2c2c2e]">
+        <div>
+            <h1 class="text-2xl font-bold text-white tracking-tight">切込寸法 計算 <span class="text-xs font-normal text-[#d1d1d6] ml-2">iPad Landscape Edition</span></h1>
+        </div>
+        <p class="text-xs font-black text-[#d1d1d6] uppercase tracking-widest">KYOWA ROOF SYSTEM</p>
+    </header>
+
+    <main class="flex-grow flex p-6 gap-6">
+        <!-- 左列: 計算エリア (縦並び) -->
+        <div class="w-7/12 column-scroll space-y-6 pr-2">
+            
+            <!-- 横切込 Section -->
+            <section id="sectionSide">
+                <div class="flex items-center gap-3 mb-3">
+                    <span class="w-2 h-6 rounded-full" style="background-color: var(--side-color);"></span>
+                    <h2 class="text-lg font-bold">横切込</h2>
+                </div>
+                <div class="input-card p-4 mb-4">
+                    <div class="grid grid-cols-2 gap-4 mb-3">
+                        <div>
+                            <label class="block text-xs font-semibold text-[#d1d1d6] mb-1">働き幅 (＠)</label>
+                            <input type="text" inputmode="numeric" id="side_a" placeholder="働き幅" oninput="formatInput(this); calculateSide();" class="w-full rounded-xl px-3 py-2 text-xl font-bold text-center outline-none">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-semibold text-[#d1d1d6] mb-1">横幅 (開口部)</label>
+                            <input type="text" inputmode="numeric" id="side_l2" placeholder="横幅" oninput="formatInput(this); calculateSide();" class="w-full rounded-xl px-3 py-2 text-xl font-bold text-center outline-none">
+                        </div>
+                    </div>
+                    <div class="flex gap-4">
+                        <div class="w-20">
+                            <label class="block text-xs font-semibold text-[#d1d1d6] mb-1 text-center">No.</label>
+                            <input type="text" inputmode="numeric" id="side_no" maxlength="2" placeholder="No" class="w-full rounded-xl px-2 py-2 text-xl font-bold text-center outline-none input-highlight-side">
+                        </div>
+                        <div class="flex-1">
+                            <label class="block text-xs font-semibold text-[#d1d1d6] mb-1">寸法 (張方向↔︎対象)</label>
+                            <input type="text" inputmode="numeric" id="side_l1" placeholder="寸法を入力" oninput="formatInput(this); calculateSide();" class="w-full rounded-xl px-3 py-2 text-xl font-bold text-center outline-none input-highlight-side">
+                        </div>
+                        <div class="flex items-end pb-0.5">
+                            <button onclick="saveCurrent('side')" class="save-btn-3d-side h-[46px] px-6 rounded-xl font-bold text-white shadow-lg active:scale-95 transition-transform">保存</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="sideResult" class="hidden animate-in fade-in slide-in-from-top-2 duration-300">
+                    <!-- 1行表示：横切込結果 -->
+                    <div class="grid grid-cols-2 gap-3 mb-3">
+                        <div class="bg-[#1c1c1e] rounded-xl py-2 px-4 border border-[#2c2c2e] flex items-center justify-between">
+                            <span class="text-xs font-bold text-[#d1d1d6]">左側切込</span>
+                            <span id="sideOutZ" class="text-2xl font-black text-[#0a84ff]">0</span>
+                        </div>
+                        <div class="bg-[#1c1c1e] rounded-xl py-2 px-4 border border-[#2c2c2e] flex items-center justify-between">
+                            <span class="text-xs font-bold text-[#d1d1d6]">右側切込</span>
+                            <span id="sideOutY" class="text-2xl font-black text-[#30d158]">0</span>
+                        </div>
+                    </div>
+                    <!-- 切替タブを中央に配置 -->
+                    <div class="flex justify-center items-center relative mb-2">
+                         <div class="dir-switch-bar flex gap-1">
+                            <button type="button" onclick="setCalcDir('LtoR')" id="btnLtoR" class="dir-button font-bold dir-active">左←右</button>
+                            <button type="button" onclick="setCalcDir('RtoL')" id="btnRtoL" class="dir-button font-bold">左→右</button>
+                        </div>
+                        <span class="absolute right-1 text-[10px] font-bold text-[#636366]">PREVIEW</span>
+                    </div>
+                    <div id="sideSvgContainer" class="bg-black rounded-xl border border-[#333] overflow-hidden aspect-[2.5/1]"></div>
+                </div>
+            </section>
+
+            <div class="border-t border-[#2c2c2e] my-2"></div>
+
+            <!-- 縦切込 Section -->
+            <section id="sectionHeight">
+                <div class="flex items-center gap-3 mb-3">
+                    <span class="w-2 h-6 rounded-full" style="background-color: var(--height-color);"></span>
+                    <h2 class="text-lg font-bold">縦切込</h2>
+                </div>
+                <div class="input-card p-4 mb-4">
+                    <div class="grid grid-cols-2 gap-4 mb-3">
+                        <div>
+                            <label class="block text-xs font-semibold text-[#d1d1d6] mb-1">全長 (L)</label>
+                            <input type="text" inputmode="numeric" id="h_total" placeholder="全長" oninput="formatInput(this); calculateHeight();" class="w-full rounded-xl px-3 py-2 text-xl font-bold text-center outline-none">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-semibold text-[#d1d1d6] mb-1">縦幅 (開口部)</label>
+                            <input type="text" inputmode="numeric" id="h_l2" placeholder="縦幅" oninput="formatInput(this); calculateHeight();" class="w-full rounded-xl px-3 py-2 text-xl font-bold text-center outline-none">
+                        </div>
+                    </div>
+                    <div class="flex gap-4">
+                        <div class="w-20">
+                            <label class="block text-xs font-semibold text-[#d1d1d6] mb-1 text-center">No.</label>
+                            <input type="text" inputmode="numeric" id="h_no" maxlength="2" placeholder="No" class="w-full rounded-xl px-2 py-2 text-xl font-bold text-center outline-none input-highlight-height">
+                        </div>
+                        <div class="flex-1">
+                            <label class="block text-xs font-semibold text-[#d1d1d6] mb-1">寸法 (下↑対象)</label>
+                            <input type="text" inputmode="numeric" id="h_l1" placeholder="寸法を入力" oninput="formatInput(this); calculateHeight();" class="w-full rounded-xl px-3 py-2 text-xl font-bold text-center outline-none input-highlight-height">
+                        </div>
+                        <div class="flex items-end pb-0.5">
+                            <button onclick="saveCurrent('height')" class="save-btn-3d-height h-[46px] px-6 rounded-xl font-bold text-white shadow-lg active:scale-95 transition-transform">保存</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="heightResult" class="hidden animate-in fade-in slide-in-from-top-2 duration-300">
+                    <!-- 1行表示：縦切込結果 -->
+                    <div class="grid grid-cols-3 gap-2 mb-3">
+                        <div class="bg-[#1c1c1e] rounded-xl py-2 px-3 border border-[#2c2c2e] flex items-center justify-between">
+                            <span class="text-[10px] font-bold text-[#d1d1d6]">下 切込</span>
+                            <span id="hOutD" class="text-xl font-black text-white">0</span>
+                        </div>
+                        <div class="bg-[#1c1c1e] rounded-xl py-2 px-3 border border-[#2c2c2e] flex items-center justify-between">
+                            <span class="text-[10px] font-bold text-[#d1d1d6]">上 切込</span>
+                            <span id="hOutU" class="text-xl font-black text-[#5e5ce6]">0</span>
+                        </div>
+                        <div class="bg-[#1c1c1e] rounded-xl py-2 px-3 border border-[#2c2c2e] flex items-center justify-between">
+                            <span class="text-[10px] font-bold text-[#d1d1d6]">上寸法</span>
+                            <span id="hOutT" class="text-xl font-black text-[#30d158]">0</span>
+                        </div>
+                    </div>
+                    <div id="heightSvgContainer" class="bg-black rounded-xl border border-[#333] overflow-hidden aspect-[2.5/1]"></div>
+                </div>
+            </section>
+        </div>
+
+        <!-- 右列: 履歴エリア -->
+        <div class="w-5/12 column-scroll border-l border-[#2c2c2e] pl-6">
+            <div class="flex items-center justify-between mb-6 sticky top-0 bg-black py-2 z-10">
+                <h2 class="text-xl font-black text-white tracking-tight flex items-center gap-2">
+                    <svg class="w-5 h-5 text-[#8e8e93]" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clip-rule="evenodd"></path></svg>
+                    計算履歴
+                </h2>
+                <button type="button" onclick="openConfirm('all')" class="btn-gray-3d text-[10px] font-black px-4 py-1.5 rounded-full uppercase">一括削除</button>
+            </div>
+
+            <div class="space-y-10 pb-10">
+                <!-- 横履歴 -->
+                <div>
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="text-[#d1d1d6] text-sm font-bold uppercase tracking-widest flex items-center gap-2">
+                            <span class="w-1.5 h-1.5 rounded-full" style="background-color: var(--side-color);"></span>
+                            横切込 履歴
+                        </h3>
+                        <button type="button" onclick="openConfirm('category', '横')" class="btn-silver-3d text-[9px] font-black px-3 py-1 rounded-full">削除</button>
+                    </div>
+                    <div id="sideHistoryList" class="space-y-3"></div>
+                </div>
+
+                <!-- 縦履歴 -->
+                <div>
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="text-[#d1d1d6] text-sm font-bold uppercase tracking-widest flex items-center gap-2">
+                            <span class="w-1.5 h-1.5 rounded-full" style="background-color: var(--height-color);"></span>
+                            縦切込 履歴
+                        </h3>
+                        <button type="button" onclick="openConfirm('category', '縦')" class="btn-silver-3d text-[9px] font-black px-3 py-1 rounded-full">削除</button>
+                    </div>
+                    <div id="heightHistoryList" class="space-y-3"></div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Modal -->
+    <div id="customConfirmModal" class="hidden fixed inset-0 flex items-center justify-center p-6 shadow-2xl" style="background: rgba(0,0,0,0.85); backdrop-filter: blur(8px); z-index: 9999;">
+        <div class="bg-[#1c1c1e] w-full max-sm rounded-3xl p-6 border border-[#3a3a3c] text-center shadow-2xl">
+            <h4 class="text-lg font-bold text-white mb-2">確認</h4>
+            <p id="confirmMessage" class="text-[#d1d1d6] text-sm mb-6"></p>
+            <div class="flex gap-3">
+                <button type="button" onclick="document.getElementById('customConfirmModal').classList.add('hidden')" class="flex-1 bg-[#2c2c2e] text-white font-bold py-3 rounded-xl">キャンセル</button>
+                <button type="button" onclick="executeConfirm()" class="flex-1 bg-[#ff453a] text-white font-bold py-3 rounded-xl">削除する</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    let calcDirection = 'LtoR';
+    let lastSideRes = null, lastHeightRes = null;
+
+    function formatNumber(num) { return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+    function unformatNumber(str) { return str ? str.replace(/,/g, '') : ''; }
+
+    window.formatInput = function(el) {
+        let val = unformatNumber(el.value);
+        if (isNaN(val) && val !== "") { el.value = el.dataset.oldValue || ""; return; }
+        el.value = (val === "") ? "" : formatNumber(val);
+        el.dataset.oldValue = el.value;
+    };
+
+    window.setCalcDir = function(dir) {
+        calcDirection = dir;
+        document.getElementById('btnLtoR').classList.toggle('dir-active', dir === 'LtoR');
+        document.getElementById('btnRtoL').classList.toggle('dir-active', dir === 'RtoL');
+        calculateSide();
+    };
+
+    window.calculateSide = function() {
+        const aVal = unformatNumber(document.getElementById('side_a').value);
+        const l2Val = unformatNumber(document.getElementById('side_l2').value);
+        const l1Val = unformatNumber(document.getElementById('side_l1').value);
+        const noVal = document.getElementById('side_no').value;
+        const a = parseFloat(aVal), l2 = parseFloat(l2Val), l1 = parseFloat(l1Val);
+        
+        const resDiv = document.getElementById('sideResult');
+        if (isNaN(l1) || isNaN(l2) || isNaN(a) || a <= 0) { resDiv.classList.add('hidden'); lastSideRes = null; return; }
+
+        let z, y;
+        if (calcDirection === 'LtoR') { y = l1 % a; z = (a - ((l1 + l2) % a)) % a; } else { z = l1 % a; y = (a - ((l1 + l2) % a)) % a; }
+        const fZ = Math.round(z * 10) / 10, fY = Math.round(y * 10) / 10;
+        
+        document.getElementById('sideOutZ').innerText = formatNumber(fZ);
+        document.getElementById('sideOutY').innerText = formatNumber(fY);
+        
+        updateSideSVG(l1, l2, a, fZ, fY);
+        resDiv.classList.remove('hidden');
+        lastSideRes = { mode: '横', no: noVal || '-', inputs: { a, l2, l1 }, outputs: { z: fZ, y: fY }, calcDir: calcDirection };
+    };
+
+    window.calculateHeight = function() {
+        const tVal = unformatNumber(document.getElementById('h_total').value), 
+              l2Val = unformatNumber(document.getElementById('h_l2').value), 
+              l1Val = unformatNumber(document.getElementById('h_l1').value), 
+              noVal = document.getElementById('h_no').value;
+        const t = parseFloat(tVal), l2 = parseFloat(l2Val), l1 = parseFloat(l1Val);
+        
+        const resDiv = document.getElementById('heightResult');
+        if (isNaN(t) || isNaN(l1) || isNaN(l2) || t <= 0) { resDiv.classList.add('hidden'); lastHeightRes = null; return; }
+        
+        const rD = l1, rU = l1 + l2, rT = t - rU;
+        document.getElementById('hOutD').innerText = formatNumber(rD);
+        document.getElementById('hOutU').innerText = formatNumber(rU);
+        document.getElementById('hOutT').innerText = formatNumber(rT);
+        
+        updateHeightSVG(t, l1, l2, rU, rT);
+        resDiv.classList.remove('hidden');
+        lastHeightRes = { mode: '縦', no: noVal || '-', inputs: { total: t, l2, l1 }, outputs: { down: rD, up: rU, top: rT } };
+    };
+
+    window.saveCurrent = function(type) {
+        const res = type === 'side' ? lastSideRes : lastHeightRes;
+        if (res) window.saveToCloud({...res});
+    };
+
+    window.applyHistoryItem = function(id) {
+        const item = window.historyData.find(d => d.id === id);
+        if (!item) return;
+        if (item.mode === '横') {
+            document.getElementById('side_a').value = formatNumber(item.inputs.a);
+            document.getElementById('side_l2').value = formatNumber(item.inputs.l2);
+            document.getElementById('side_l1').value = formatNumber(item.inputs.l1);
+            document.getElementById('side_no').value = item.no;
+            if (item.calcDir) window.setCalcDir(item.calcDir);
+            calculateSide();
+            document.getElementById('sectionSide').scrollIntoView({ behavior: 'smooth' });
+        } else {
+            document.getElementById('h_total').value = formatNumber(item.inputs.total);
+            document.getElementById('h_l2').value = formatNumber(item.inputs.l2);
+            document.getElementById('h_l1').value = formatNumber(item.inputs.l1);
+            document.getElementById('h_no').value = item.no;
+            calculateHeight();
+            document.getElementById('sectionHeight').scrollIntoView({ behavior: 'smooth' });
+        }
+    };
+
+    function updateSideSVG(l1, l2, a, zVal, yVal) {
+        const svgW = 400, svgH = 160;
+        const scale = 340 / (6 * a), joints = [];
+        const centerWorld = l1 + (l2 / 2);
+        const startJointIndex = Math.floor(centerWorld / a) - 3;
+        let jointsHtml = "";
+        for (let i = 0; i < 7; i++) {
+            const jWorld = (startJointIndex + i) * a;
+            const jX = 200 + (jWorld - centerWorld) * scale;
+            joints.push(jX);
+            jointsHtml += `<line x1="${jX}" y1="10" x2="${jX}" y2="${svgH-10}" stroke="#444" stroke-width="1" stroke-dasharray="5,3" />`;
+        }
+        const winW = l2 * scale, winLE = 200 + (l1 - centerWorld) * scale, winRE = winLE + winW;
+        const jZ = [...joints].reverse().find(j => j <= winLE + 1.5), jY = joints.find(j => j >= winRE - 1.5);
+        const dirX = calcDirection === 'LtoR' ? 385 : 15, dirAnchor = calcDirection === 'LtoR' ? 'end' : 'start';
+
+        document.getElementById('sideSvgContainer').innerHTML = `
+            <svg viewBox="0 0 ${svgW} ${svgH}" class="w-full h-full">
+                <rect x="5" y="5" width="390" height="${svgH-10}" fill="none" stroke="#333" stroke-width="1" />
+                ${jointsHtml}
+                <rect x="${winLE}" y="40" width="${winW}" height="60" fill="#2c2c2e" stroke="#ffffff" stroke-width="2" />
+                <text x="${winLE + winW/2}" y="75" text-anchor="middle" font-size="12" fill="#ffffff" font-weight="900">開口</text>
+                <line x1="${winLE}" y1="${svgH-35}" x2="${jZ || 0}" y2="${svgH-35}" stroke="#0a84ff" stroke-width="4" />
+                <text x="${(winLE + (jZ||0))/2}" y="${svgH-12}" text-anchor="middle" font-size="20" fill="#0a84ff" font-weight="bold">${formatNumber(zVal)}</text>
+                <line x1="${winRE}" y1="${svgH-35}" x2="${jY || 400}" y2="${svgH-35}" stroke="#30d158" stroke-width="4" />
+                <text x="${(winRE + (jY||400))/2}" y="${svgH-12}" text-anchor="middle" font-size="20" fill="#30d158" font-weight="bold">${formatNumber(yVal)}</text>
+                <text x="${dirX}" y="20" text-anchor="${dirAnchor}" font-size="10" fill="#ff9f0a" font-weight="bold">${calcDirection === 'LtoR' ? '← 張方向' : '張方向 →'}</text>
+                <text x="${dirX}" y="70" text-anchor="${dirAnchor}" font-size="13" fill="#ffffff" font-weight="bold">W:${formatNumber(l1)}</text>
+            </svg>`;
+    }
+
+    function updateHeightSVG(total, l1, l2, rUp, rTop) {
+        const svgW = 400, svgH = 160;
+        const hS = (svgH - 40) / total, wB = svgH - 25, wT = 15, winYB = wB - (l1 * hS), winH = l2 * hS, winYT = winYB - winH;
+        document.getElementById('heightSvgContainer').innerHTML = `
+            <svg viewBox="0 0 ${svgW} ${svgH}" class="w-full h-full">
+                <rect x="150" y="${wT}" width="100" height="${wB - wT}" fill="none" stroke="#333" stroke-width="2" />
+                <rect x="160" y="${winYT}" width="80" height="${winH}" fill="#2c2c2e" stroke="#ffffff" stroke-width="2" />
+                <text x="200" y="${winYT + winH/2 + 5}" text-anchor="middle" font-size="12" fill="#ffffff" font-weight="bold">開口</text>
+                <line x1="130" y1="${wB}" x2="130" y2="${winYB}" stroke="#ffffff" stroke-width="4" />
+                <text x="120" y="${(wB + winYB)/2 + 8}" text-anchor="end" font-size="22" fill="#ffffff" font-weight="bold">${formatNumber(l1)}</text>
+                <line x1="270" y1="${wB}" x2="270" y2="${winYT}" stroke="#5e5ce6" stroke-width="4" />
+                <text x="280" y="${(wB + winYT)/2 + 8}" text-anchor="start" font-size="22" fill="#5e5ce6" font-weight="bold">${formatNumber(rUp)}</text>
+                <line x1="130" y1="${winYT}" x2="130" y2="${wT}" stroke="#30d158" stroke-width="4" />
+                <text x="120" y="${(winYT + wT)/2 + 8}" text-anchor="end" font-size="22" fill="#30d158" font-weight="bold">${formatNumber(rTop)}</text>
+                <text x="150" y="${wB + 15}" font-size="9" fill="#636366">下端 0</text>
+            </svg>`;
+    }
+
+    window.renderHistory = function() {
+        const sideList = document.getElementById('sideHistoryList'), heightList = document.getElementById('heightHistoryList');
+        const render = item => {
+            const themeColor = item.mode === '横' ? '#ff9f0a' : '#e67600';
+            const outputs = item.mode === '横' ? 
+                `<div class="flex gap-4 mt-1"><div class="flex items-baseline"><span class="text-[10px] text-[#8e8e93] mr-1">左</span><span class="text-lg font-black text-[#0a84ff]">${formatNumber(item.outputs.z)}</span></div><div class="flex items-baseline"><span class="text-[10px] text-[#8e8e93] mr-1">右</span><span class="text-lg font-black text-[#30d158]">${formatNumber(item.outputs.y)}</span></div></div>` :
+                `<div class="flex gap-3 mt-1"><div class="flex items-baseline"><span class="text-[10px] text-[#8e8e93] mr-1">下</span><span class="text-lg font-black text-white">${formatNumber(item.outputs.down)}</span></div><div class="flex items-baseline"><span class="text-[10px] text-[#8e8e93] mr-1">上</span><span class="text-lg font-black text-[#5e5ce6]">${formatNumber(item.outputs.up)}</span></div><div class="flex items-baseline"><span class="text-[10px] text-[#8e8e93] mr-1">寸</span><span class="text-lg font-black text-[#30d158]">${formatNumber(item.outputs.top)}</span></div></div>`;
+
+            return `<div class="history-item p-3 rounded-xl border flex flex-col gap-1 shadow-md" onclick="applyHistoryItem('${item.id}')" style="${item.checked ? 'border-color:'+themeColor+';' : 'border-color:#2c2c2e;'}">
+                <div class="flex items-center justify-between">
+                    <div class="flex items-center gap-2">
+                        <button type="button" onclick="event.stopPropagation(); toggleCheck('${item.id}', ${item.checked})" class="${item.checked ? 'text-['+themeColor+']' : 'text-white bg-[#444] rounded-full p-0.5'}" style="${item.checked ? 'color:'+themeColor : ''}">
+                            <svg class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/></svg>
+                        </button>
+                        <span class="text-xs font-bold text-[#8e8e93]">No.${item.no}</span>
+                        <span class="text-sm font-bold text-white">${item.mode==='横'?'寸法':'下寸'}: ${formatNumber(item.inputs.l1)}</span>
+                    </div>
+                    <span class="text-[9px] font-black uppercase text-[#636366]">${item.calcDir ? (item.calcDir==='LtoR'?'左←':'左→') : ''}</span>
+                </div>
+                <div class="bg-black py-1.5 px-3 rounded-lg border border-[#2c2c2e] flex justify-center">${outputs}</div>
+            </div>`;
+        };
+        sideList.innerHTML = window.historyData.filter(d => d.mode === '横').map(render).join('') || '<p class="text-center text-[#333] py-4 italic text-xs">No Data</p>';
+        heightList.innerHTML = window.historyData.filter(d => d.mode === '縦').map(render).join('') || '<p class="text-center text-[#333] py-4 italic text-xs">No Data</p>';
+    };
+</script>
+
+</body>
+</html>
