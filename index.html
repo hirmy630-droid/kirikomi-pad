@@ -17,10 +17,12 @@
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'cutting-calc-app';
         let lastSavedHash = ""; 
         
-        const useLocalState = typeof __firebase_config === 'undefined';
+        // アプリ終了後も残るようにFirestoreを優先
+        const hasConfig = typeof __firebase_config !== 'undefined';
 
         const initFirebase = async () => {
-            if (useLocalState) {
+            if (!hasConfig) {
+                console.warn("Firebase構成が見つかりません。セッション内のみの保存になります。");
                 window.renderHistory();
                 return;
             }
@@ -31,6 +33,7 @@
                 auth = getAuth(app);
                 db = getFirestore(app);
 
+                // RULE 3: Auth Before Queries
                 const initAuth = async () => {
                     if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
                         await signInWithCustomToken(auth, __initial_auth_token);
@@ -53,9 +56,11 @@
         };
 
         const loadHistory = () => {
-            if (useLocalState || !userId) return;
+            if (!userId) return;
+            // RULE 1: Strict Paths
             const historyCol = collection(db, 'artifacts', appId, 'users', userId, 'history');
             
+            // RULE 2: No Complex Queries (Sort in memory)
             onSnapshot(historyCol, async (snapshot) => {
                 const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                 window.historyData = data.sort((a, b) => {
@@ -63,9 +68,10 @@
                     return b.createdAt - a.createdAt;
                 });
                 
+                // 自動整理：チェック（ロック）されていない古い履歴を削除
                 const uncheckedItems = window.historyData.filter(item => !item.checked);
-                if (uncheckedItems.length > 5) {
-                    const toDelete = uncheckedItems.slice(5); 
+                if (uncheckedItems.length > 8) {
+                    const toDelete = uncheckedItems.slice(8); 
                     const batch = writeBatch(db);
                     toDelete.forEach(item => {
                         batch.delete(doc(db, 'artifacts', appId, 'users', userId, 'history', item.id));
@@ -80,45 +86,32 @@
 
         window.saveToCloud = async (item) => {
             if (!item) return;
+            // 同一データの連続保存を防止
             const hash = JSON.stringify(item.inputs) + item.mode + item.no + (item.calcDir || '');
             if (hash === lastSavedHash) return; 
             lastSavedHash = hash;
 
             const newItem = { ...item, checked: false, createdAt: Date.now() };
 
-            if (useLocalState) {
+            if (!userId) {
+                // Fallback for no-firebase environment
                 newItem.id = Date.now().toString();
                 window.historyData.unshift(newItem);
-                window.historyData.sort((a, b) => {
-                    if (a.checked !== b.checked) return a.checked ? -1 : 1;
-                    return b.createdAt - a.createdAt;
-                });
-                const uncheckedItems = window.historyData.filter(d => !d.checked);
-                if (uncheckedItems.length > 5) {
-                    const idsToDelete = uncheckedItems.slice(5).map(d => d.id);
-                    window.historyData = window.historyData.filter(d => !idsToDelete.includes(d.id));
-                }
                 window.renderHistory();
                 return;
             }
 
-            if (!userId) return;
             const historyCol = collection(db, 'artifacts', appId, 'users', userId, 'history');
             await addDoc(historyCol, newItem);
         };
 
         window.toggleCheck = async (id, currentStatus) => {
-            if (useLocalState) {
+            if (!userId) {
                 const item = window.historyData.find(d => d.id === id);
                 if (item) item.checked = !currentStatus;
-                window.historyData.sort((a, b) => {
-                    if (a.checked !== b.checked) return a.checked ? -1 : 1;
-                    return b.createdAt - a.createdAt;
-                });
                 window.renderHistory();
                 return;
             }
-            if (!userId) return;
             const docRef = doc(db, 'artifacts', appId, 'users', userId, 'history', id);
             await updateDoc(docRef, { checked: !currentStatus });
         };
@@ -127,30 +120,25 @@
             const modal = document.getElementById('customConfirmModal');
             const msg = document.getElementById('confirmMessage');
             window.pendingAction = { action, mode };
-            msg.innerText = action === 'category' ? `${mode}切込の履歴を削除しますか？` : "全ての履歴を一括削除しますか？";
+            msg.innerText = action === 'category' ? `${mode}切込の履歴（ロック中以外）を削除しますか？` : "ロック中以外の全ての履歴を一括削除しますか？";
             modal.classList.remove('hidden');
         };
 
         window.executeConfirm = async () => {
             if (!window.pendingAction) return;
             const { action, mode } = window.pendingAction;
-            if (useLocalState) {
-                window.historyData = window.historyData.filter(d => {
-                    if (d.checked) return true;
-                    if (action === 'all') return false;
-                    if (action === 'category' && d.mode === mode) return false;
-                    return true;
-                });
-                document.getElementById('customConfirmModal').classList.add('hidden');
-                window.renderHistory();
-                return;
-            }
-            if (!userId) return;
+            
             let itemsToDelete = window.historyData.filter(d => !d.checked && (action === 'all' || d.mode === mode));
-            if (itemsToDelete.length > 0) {
-                const batch = writeBatch(db);
-                itemsToDelete.forEach(d => batch.delete(doc(db, 'artifacts', appId, 'users', userId, 'history', d.id)));
-                await batch.commit();
+            
+            if (userId) {
+                if (itemsToDelete.length > 0) {
+                    const batch = writeBatch(db);
+                    itemsToDelete.forEach(d => batch.delete(doc(db, 'artifacts', appId, 'users', userId, 'history', d.id)));
+                    await batch.commit();
+                }
+            } else {
+                window.historyData = window.historyData.filter(d => d.checked || (action !== 'all' && d.mode !== mode));
+                window.renderHistory();
             }
             document.getElementById('customConfirmModal').classList.add('hidden');
         };
@@ -196,20 +184,9 @@
             border-radius: 6px; 
         }
 
-        .save-btn-3d-side {
-            background: linear-gradient(180deg, #ffb340 0%, #ff9f0a 100%);
-            border-bottom: 4px solid #cc7f08;
-        }
-        .save-btn-3d-height {
-            background: linear-gradient(180deg, #ff8c00 0%, #e67600 100%);
-            border-bottom: 4px solid #994f00;
-        }
-        .save-btn-3d-side:active, .save-btn-3d-height:active { border-bottom-width: 0px; transform: translateY(4px); }
-
         .btn-gray-3d { background: linear-gradient(180deg, #aeaeb2 0%, #8e8e93 100%); color: #ffffff; border: 1px solid #aeaeb2; box-shadow: 0 3px 0 #3a3a3c; }
         .btn-silver-3d { background: linear-gradient(180deg, #f2f2f7 0%, #d1d1d6 100%); color: #1c1c1e; border: 1px solid #ffffff; box-shadow: 0 3px 0 #48484a; }
 
-        /* iPad 2列レイアウト用のスクロール設定 */
         .column-scroll {
             height: calc(100vh - 100px);
             overflow-y: auto;
@@ -232,7 +209,7 @@
     </header>
 
     <main class="flex-grow flex p-6 gap-6">
-        <!-- 左列: 計算エリア (縦並び) -->
+        <!-- 左列: 計算エリア -->
         <div class="w-7/12 column-scroll space-y-6 pr-2">
             
             <!-- 横切込 Section -->
@@ -242,44 +219,39 @@
                     <h2 class="text-lg font-bold">横切込</h2>
                 </div>
                 <div class="input-card p-4 mb-4">
-                    <div class="grid grid-cols-2 gap-4 mb-3">
+                    <div class="grid grid-cols-2 gap-4 mb-4">
                         <div>
                             <label class="block text-xs font-semibold text-[#d1d1d6] mb-1">働き幅 (＠)</label>
-                            <input type="text" inputmode="numeric" id="side_a" placeholder="働き幅" oninput="formatInput(this); calculateSide();" class="w-full rounded-xl px-3 py-2 text-xl font-bold text-center outline-none">
+                            <input type="text" inputmode="numeric" id="side_a" placeholder="働き幅" onfocus="this.select()" oninput="formatInput(this); calculateSide();" onblur="saveCurrent('side')" onkeydown="if(event.key==='Enter') { this.blur(); saveCurrent('side'); }" class="w-full rounded-xl px-3 py-3 text-2xl font-bold text-center outline-none">
                         </div>
                         <div>
                             <label class="block text-xs font-semibold text-[#d1d1d6] mb-1">横幅 (開口部)</label>
-                            <input type="text" inputmode="numeric" id="side_l2" placeholder="横幅" oninput="formatInput(this); calculateSide();" class="w-full rounded-xl px-3 py-2 text-xl font-bold text-center outline-none">
+                            <input type="text" inputmode="numeric" id="side_l2" placeholder="横幅" onfocus="this.select()" oninput="formatInput(this); calculateSide();" onblur="saveCurrent('side')" onkeydown="if(event.key==='Enter') { this.blur(); saveCurrent('side'); }" class="w-full rounded-xl px-3 py-3 text-2xl font-bold text-center outline-none">
                         </div>
                     </div>
                     <div class="flex gap-4">
-                        <div class="w-20">
+                        <div class="w-24">
                             <label class="block text-xs font-semibold text-[#d1d1d6] mb-1 text-center">No.</label>
-                            <input type="text" inputmode="numeric" id="side_no" maxlength="2" placeholder="No" class="w-full rounded-xl px-2 py-2 text-xl font-bold text-center outline-none input-highlight-side">
+                            <input type="text" inputmode="numeric" id="side_no" maxlength="3" placeholder="No" onfocus="this.select()" onblur="saveCurrent('side')" onkeydown="if(event.key==='Enter') { this.blur(); saveCurrent('side'); }" class="w-full rounded-xl px-2 py-3 text-2xl font-bold text-center outline-none input-highlight-side">
                         </div>
                         <div class="flex-1">
                             <label class="block text-xs font-semibold text-[#d1d1d6] mb-1">寸法 (張方向↔︎対象)</label>
-                            <input type="text" inputmode="numeric" id="side_l1" placeholder="寸法を入力" oninput="formatInput(this); calculateSide();" class="w-full rounded-xl px-3 py-2 text-xl font-bold text-center outline-none input-highlight-side">
-                        </div>
-                        <div class="flex items-end pb-0.5">
-                            <button onclick="saveCurrent('side')" class="save-btn-3d-side h-[46px] px-6 rounded-xl font-bold text-white shadow-lg active:scale-95 transition-transform">保存</button>
+                            <input type="text" inputmode="numeric" id="side_l1" placeholder="寸法を入力" onfocus="this.select()" oninput="formatInput(this); calculateSide();" onblur="saveCurrent('side')" onkeydown="if(event.key==='Enter') { this.blur(); saveCurrent('side'); }" class="w-full rounded-xl px-3 py-3 text-2xl font-bold text-center outline-none input-highlight-side">
                         </div>
                     </div>
                 </div>
 
                 <div id="sideResult" class="hidden animate-in fade-in slide-in-from-top-2 duration-300">
-                    <!-- 1行表示：横切込結果 -->
                     <div class="grid grid-cols-2 gap-3 mb-3">
-                        <div class="bg-[#1c1c1e] rounded-xl py-2 px-4 border border-[#2c2c2e] flex items-center justify-between">
+                        <div class="bg-[#1c1c1e] rounded-xl py-3 px-4 border border-[#2c2c2e] flex items-center justify-between">
                             <span class="text-xs font-bold text-[#d1d1d6]">左側切込</span>
-                            <span id="sideOutZ" class="text-2xl font-black text-[#0a84ff]">0</span>
+                            <span id="sideOutZ" class="text-3xl font-black text-[#0a84ff]">0</span>
                         </div>
-                        <div class="bg-[#1c1c1e] rounded-xl py-2 px-4 border border-[#2c2c2e] flex items-center justify-between">
+                        <div class="bg-[#1c1c1e] rounded-xl py-3 px-4 border border-[#2c2c2e] flex items-center justify-between">
                             <span class="text-xs font-bold text-[#d1d1d6]">右側切込</span>
-                            <span id="sideOutY" class="text-2xl font-black text-[#30d158]">0</span>
+                            <span id="sideOutY" class="text-3xl font-black text-[#30d158]">0</span>
                         </div>
                     </div>
-                    <!-- 切替タブを中央に配置 -->
                     <div class="flex justify-center items-center relative mb-2">
                          <div class="dir-switch-bar flex gap-1">
                             <button type="button" onclick="setCalcDir('LtoR')" id="btnLtoR" class="dir-button font-bold dir-active">左←右</button>
@@ -291,7 +263,7 @@
                 </div>
             </section>
 
-            <div class="border-t border-[#2c2c2e] my-2"></div>
+            <div class="border-t border-[#2c2c2e] my-4"></div>
 
             <!-- 縦切込 Section -->
             <section id="sectionHeight">
@@ -300,33 +272,29 @@
                     <h2 class="text-lg font-bold">縦切込</h2>
                 </div>
                 <div class="input-card p-4 mb-4">
-                    <div class="grid grid-cols-2 gap-4 mb-3">
+                    <div class="grid grid-cols-2 gap-4 mb-4">
                         <div>
                             <label class="block text-xs font-semibold text-[#d1d1d6] mb-1">全長 (L)</label>
-                            <input type="text" inputmode="numeric" id="h_total" placeholder="全長" oninput="formatInput(this); calculateHeight();" class="w-full rounded-xl px-3 py-2 text-xl font-bold text-center outline-none">
+                            <input type="text" inputmode="numeric" id="h_total" placeholder="全長" onfocus="this.select()" oninput="formatInput(this); calculateHeight();" onblur="saveCurrent('height')" onkeydown="if(event.key==='Enter') { this.blur(); saveCurrent('height'); }" class="w-full rounded-xl px-3 py-3 text-2xl font-bold text-center outline-none">
                         </div>
                         <div>
                             <label class="block text-xs font-semibold text-[#d1d1d6] mb-1">縦幅 (開口部)</label>
-                            <input type="text" inputmode="numeric" id="h_l2" placeholder="縦幅" oninput="formatInput(this); calculateHeight();" class="w-full rounded-xl px-3 py-2 text-xl font-bold text-center outline-none">
+                            <input type="text" inputmode="numeric" id="h_l2" placeholder="縦幅" onfocus="this.select()" oninput="formatInput(this); calculateHeight();" onblur="saveCurrent('height')" onkeydown="if(event.key==='Enter') { this.blur(); saveCurrent('height'); }" class="w-full rounded-xl px-3 py-3 text-2xl font-bold text-center outline-none">
                         </div>
                     </div>
                     <div class="flex gap-4">
-                        <div class="w-20">
+                        <div class="w-24">
                             <label class="block text-xs font-semibold text-[#d1d1d6] mb-1 text-center">No.</label>
-                            <input type="text" inputmode="numeric" id="h_no" maxlength="2" placeholder="No" class="w-full rounded-xl px-2 py-2 text-xl font-bold text-center outline-none input-highlight-height">
+                            <input type="text" inputmode="numeric" id="h_no" maxlength="3" placeholder="No" onfocus="this.select()" onblur="saveCurrent('height')" onkeydown="if(event.key==='Enter') { this.blur(); saveCurrent('height'); }" class="w-full rounded-xl px-2 py-3 text-2xl font-bold text-center outline-none input-highlight-height">
                         </div>
                         <div class="flex-1">
                             <label class="block text-xs font-semibold text-[#d1d1d6] mb-1">寸法 (下↑対象)</label>
-                            <input type="text" inputmode="numeric" id="h_l1" placeholder="寸法を入力" oninput="formatInput(this); calculateHeight();" class="w-full rounded-xl px-3 py-2 text-xl font-bold text-center outline-none input-highlight-height">
-                        </div>
-                        <div class="flex items-end pb-0.5">
-                            <button onclick="saveCurrent('height')" class="save-btn-3d-height h-[46px] px-6 rounded-xl font-bold text-white shadow-lg active:scale-95 transition-transform">保存</button>
+                            <input type="text" inputmode="numeric" id="h_l1" placeholder="寸法を入力" onfocus="this.select()" oninput="formatInput(this); calculateHeight();" onblur="saveCurrent('height')" onkeydown="if(event.key==='Enter') { this.blur(); saveCurrent('height'); }" class="w-full rounded-xl px-3 py-3 text-2xl font-bold text-center outline-none input-highlight-height">
                         </div>
                     </div>
                 </div>
 
                 <div id="heightResult" class="hidden animate-in fade-in slide-in-from-top-2 duration-300">
-                    <!-- 1行表示：縦切込結果 -->
                     <div class="grid grid-cols-3 gap-2 mb-3">
                         <div class="bg-[#1c1c1e] rounded-xl py-2 px-3 border border-[#2c2c2e] flex items-center justify-between">
                             <span class="text-[10px] font-bold text-[#d1d1d6]">下 切込</span>
@@ -353,7 +321,7 @@
                     <svg class="w-5 h-5 text-[#8e8e93]" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clip-rule="evenodd"></path></svg>
                     計算履歴
                 </h2>
-                <button type="button" onclick="openConfirm('all')" class="btn-gray-3d text-[10px] font-black px-4 py-1.5 rounded-full uppercase">一括削除</button>
+                <button type="button" onclick="openConfirm('all')" class="btn-gray-3d text-[10px] font-black px-4 py-1.5 rounded-full uppercase">未ロックを一括削除</button>
             </div>
 
             <div class="space-y-10 pb-10">
@@ -402,7 +370,7 @@
     let lastSideRes = null, lastHeightRes = null;
 
     function formatNumber(num) { return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
-    function unformatNumber(str) { return str ? str.replace(/,/g, '') : ''; }
+    function unformatNumber(str) { return str ? str.toString().replace(/,/g, '') : ''; }
 
     window.formatInput = function(el) {
         let val = unformatNumber(el.value);
@@ -538,16 +506,21 @@
     window.renderHistory = function() {
         const sideList = document.getElementById('sideHistoryList'), heightList = document.getElementById('heightHistoryList');
         const render = item => {
-            const themeColor = item.mode === '横' ? '#ff9f0a' : '#e67600';
+            const themeColor = item.mode === '横' ? 'var(--side-color)' : 'var(--height-color)';
             const outputs = item.mode === '横' ? 
                 `<div class="flex gap-4 mt-1"><div class="flex items-baseline"><span class="text-[10px] text-[#8e8e93] mr-1">左</span><span class="text-lg font-black text-[#0a84ff]">${formatNumber(item.outputs.z)}</span></div><div class="flex items-baseline"><span class="text-[10px] text-[#8e8e93] mr-1">右</span><span class="text-lg font-black text-[#30d158]">${formatNumber(item.outputs.y)}</span></div></div>` :
                 `<div class="flex gap-3 mt-1"><div class="flex items-baseline"><span class="text-[10px] text-[#8e8e93] mr-1">下</span><span class="text-lg font-black text-white">${formatNumber(item.outputs.down)}</span></div><div class="flex items-baseline"><span class="text-[10px] text-[#8e8e93] mr-1">上</span><span class="text-lg font-black text-[#5e5ce6]">${formatNumber(item.outputs.up)}</span></div><div class="flex items-baseline"><span class="text-[10px] text-[#8e8e93] mr-1">寸</span><span class="text-lg font-black text-[#30d158]">${formatNumber(item.outputs.top)}</span></div></div>`;
 
-            return `<div class="history-item p-3 rounded-xl border flex flex-col gap-1 shadow-md" onclick="applyHistoryItem('${item.id}')" style="${item.checked ? 'border-color:'+themeColor+';' : 'border-color:#2c2c2e;'}">
+            // Lock Icon SVG
+            const lockIcon = item.checked ? 
+                `<svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/></svg>` : 
+                `<svg class="w-5 h-5 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z"/></svg>`;
+
+            return `<div class="history-item p-3 rounded-xl border flex flex-col gap-1 shadow-md" onclick="applyHistoryItem('${item.id}')" style="${item.checked ? 'border-color:'+themeColor+'; background:#2c2c2e;' : 'border-color:#2c2c2e;'}">
                 <div class="flex items-center justify-between">
                     <div class="flex items-center gap-2">
-                        <button type="button" onclick="event.stopPropagation(); toggleCheck('${item.id}', ${item.checked})" class="${item.checked ? 'text-['+themeColor+']' : 'text-white bg-[#444] rounded-full p-0.5'}" style="${item.checked ? 'color:'+themeColor : ''}">
-                            <svg class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/></svg>
+                        <button type="button" onclick="event.stopPropagation(); toggleCheck('${item.id}', ${item.checked})" class="p-1 rounded-lg transition-colors" style="color:${item.checked ? themeColor : '#8e8e93'}">
+                            ${lockIcon}
                         </button>
                         <span class="text-xs font-bold text-[#8e8e93]">No.${item.no}</span>
                         <span class="text-sm font-bold text-white">${item.mode==='横'?'寸法':'下寸'}: ${formatNumber(item.inputs.l1)}</span>
